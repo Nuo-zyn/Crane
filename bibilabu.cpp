@@ -186,7 +186,6 @@ static cv::VideoCapture cap;
 static int detect_frame_count = 0;
 const int DETECT_INTERVAL = 3; // 每3帧识别一次
 static std::vector<DetectionResult> last_results; // 保存上一帧检测结果
-static std::vector<DetectionResult> last_results;
 
 static auto last_time = steady_clock::now();
 static double fps = 0.0;
