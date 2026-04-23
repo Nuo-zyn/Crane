@@ -1,13 +1,17 @@
 ﻿#include <opencv2/opencv.hpp>
-#include <opencv2/dnn.hpp>
+#include <opencv2/dnn.hpp>// 包含OpenCV深度神经网络模块，用于加载ONNX模型实现YOLO推理
 #include <iostream>
 #include <vector>
 #include <string>
-#include <chrono>
-#include <Windows.h>
-#include <algorithm>
+#include <chrono>// 时间库，用于计算FPS、处理时间间隔
+#include <Windows.h>// Windows系统头文件，提供系统级接口支持
+#include <algorithm>// 算法库，提供排序、查找等通用算法
+#include <thread>// C++多线程库，用于创建独立的推理线程
+#include <mutex>// 互斥锁，保证多线程访问共享数据时安全不冲突
+#include <atomic>// 原子变量，线程安全的布尔/数值标记，无需加锁
+#include <condition_variable>// 条件变量，用于线程间等待/通知同步
 
-#define BEAN_YOLO "D:/opencv_test/bibilabu/best.onnx"
+#define BEAN_YOLO "D:/opencv_test/bibilabu/best.onnx"	//YOLO模型的ONNX文件路径
 
 using namespace cv;
 using namespace cv::dnn;
@@ -16,303 +20,276 @@ using namespace chrono;
 
 struct yoloall
 {
-	Net net;                    // 神经网络
-	int netWidth = 640;         
-	int netHeight = 640;        
-	float confThreshold = 0.5f; 
-	float nmsThreshold = 0.45f; // 去重框用的
+	Net net;							//神经网络
+	int netWidth = 640;					
+	int netHeight = 640;
+	float confThreshold = 0.5f;			//置信度阈值
+	float nmsThreshold = 0.45f;			// 去重多余检测框
+	Mat blobCache;						// 图像预处理后的blob数据缓存，避免重复创建
+	vector<Rect> boxCache;				// 检测框缓存容器
+	vector<int> classIdCache;			// 类别ID缓存容器
+	vector<float> confCache;			// 置信度缓存容器
 };
 
-
-
-
-//数字YOLO
-class DigitalModel
+//豆子YOLO
+class YOLOModel
 {
+private:
+	yoloall all_net;
 public:
+
 	struct Result {
-		int class_id;
-		float confidence;
-		Rect bbox;
-		Point2f center;
+		int class_id;			//目标类别编号
+		float confidence;		//置信度
+		Rect bbox;				//目标矩形框
+		Point2f center;			//目标中心点坐标
 	};
 
-private:
-	dnn::Net net;
-public:
-	DigitalModel(const string& onnx_path) {
-		net = dnn::readNetFromONNX(onnx_path);
-		net.setPreferableBackend(DNN_BACKEND_OPENCV);
-		net.setPreferableTarget(DNN_TARGET_CPU);
-		cout << "[数字YOLO] 加载完成: " << onnx_path << endl;
+	YOLOModel(const string& onnx_path) {
+		// 从ONNX文件读取并加载YOLO模型
+		all_net.net = dnn::readNetFromONNX(onnx_path);
+		// 设置推理后端
+		all_net.net.setPreferableBackend(dnn::DNN_BACKEND_OPENCV);
+		// 设置推理目标：CPU推理
+		all_net.net.setPreferableTarget(dnn::DNN_TARGET_CPU);
+		//预分配缓存空间
+		all_net.boxCache.reserve(1000);
+		all_net.classIdCache.reserve(1000);
+		all_net.confCache.reserve(1000);
+		cout << "模型加载完成: " << onnx_path << endl;
 	}
 
-	vector<Result> detect(const Mat& frame) {
-		vector<Result> results;
+	// 检测函数
+	vector<YOLOModel::Result> detect(const Mat& frame) {
+		vector<YOLOModel::Result> results;
+		// 图像预处理：转为模型需要的blob格式（归一化+尺寸调整+通道交换）
+		blobFromImage(frame, all_net.blobCache, 1.0 / 255.0, Size(all_net.netWidth, all_net.netHeight), Scalar(), true, false);
+		// 将预处理后的blob数据输入到神经网络
+		all_net.net.setInput(all_net.blobCache);
+		// 执行前向推理，得到推理模型输出结果
+		Mat output = all_net.net.forward();
+		Mat outMat;
+
+		// 3维输出转2维矩阵方便遍历
+		if (output.dims == 3) {
+			outMat = Mat(output.size[1], output.size[2], CV_32F, output.data);
+		}
+		else {
+			outMat = output;
+		}
+		if (outMat.rows < outMat.cols) {
+			transpose(outMat, outMat);
+		}
+
+		int numAnchors = outMat.rows;
+		int numAttributes = outMat.cols;
+		int numClasses = numAttributes - 4;
+
+		float scaleX = (float)frame.cols / all_net.netWidth;
+		float scaleY = (float)frame.rows / all_net.netHeight;
+
+		all_net.boxCache.clear();
+		all_net.classIdCache.clear();
+		all_net.confCache.clear();
+		// 遍历每一个候选框
+		for (int i = 0; i < numAnchors; i++) {
+			const float* data = outMat.ptr<float>(i);
+			float x_center = data[0];
+			float y_center = data[1];
+			float width = data[2];
+			float height = data[3];
+
+			int classId = -1;
+			float maxConf = 0.0f;
+			// 找到置信度高的
+			for (int c = 0; c < numClasses; c++) {
+				float conf = data[4 + c];
+				if (conf > maxConf) {
+					maxConf = conf;
+					classId = c;
+				}
+			}
+			// 保留需要的
+			if (maxConf >= all_net.confThreshold) {
+				int left = (int)((x_center - width / 2) * scaleX);
+				int top = (int)((y_center - height / 2) * scaleY);
+				int w = (int)(width * scaleX);
+				int h = (int)(height * scaleY);
+
+				Rect box(left, top, w, h);
+				box = box & Rect(0, 0, frame.cols, frame.rows);
+
+				if (box.width > 2 && box.height > 2) {
+					all_net.boxCache.push_back(box);
+					all_net.classIdCache.push_back(classId);
+					all_net.confCache.push_back(maxConf);
+				}
+			}
+		}
+		vector<int> indices;
+		// 去除重复的检测框
+		NMSBoxes(all_net.boxCache, all_net.confCache, all_net.confThreshold, all_net.nmsThreshold, indices);
+		// 遍历NMS筛选后的结果，封装成Result结构体
+		for (int idx : indices) {
+			YOLOModel::Result res;
+			res.class_id = all_net.classIdCache[idx];
+			res.confidence = all_net.confCache[idx];
+			res.bbox = all_net.boxCache[idx];
+			res.center.x = res.bbox.x + res.bbox.width / 2.0f;
+			res.center.y = res.bbox.y + res.bbox.height / 2.0f;
+			results.push_back(res);
+		}
 		return results;
 	}
 };
 
-
-//豆子YOLO
-class BeanModel
-{
-private:
-	yoloall bean_net;
-public:
-	/*struct Result {
-		int class_id;
-		float confidence;
-		Rect bbox;
-		Point2f center;
-	};*/
-
-	BeanModel(const string& onnx_path) {
-		bean_net.net = dnn::readNetFromONNX(onnx_path);
-		bean_net.net.setPreferableBackend(dnn::DNN_BACKEND_OPENCV);
-		bean_net.net.setPreferableTarget(dnn::DNN_TARGET_CPU);
-		cout << "[豆子YOLO] 加载完成: " << onnx_path << endl;
-	}
-
-//豆子检测推理接口
-	vector<DigitalModel::Result> detect(const Mat& frame) {
-	vector<DigitalModel::Result> results;
-	Mat blob;
-	blobFromImage(frame, blob, 1.0 / 255.0, Size(bean_net.netWidth, bean_net.netHeight), Scalar(), true, false);
-	bean_net.net.setInput(blob);
-	Mat output = bean_net.net.forward();
-	Mat outMat;
-
-	if (output.dims == 3) {
-		outMat = Mat(output.size[1], output.size[2], CV_32F, output.data);
-	}
-	else {
-		outMat = output;
-	}
-	// 有时候数据是横着的，要转一下
-	if (outMat.rows < outMat.cols) {
-		transpose(outMat, outMat);
-	}
-
-	int numAnchors = outMat.rows;    // 多少个候选框
-	int numAttributes = outMat.cols; // 每个框几个数
-	int numClasses = numAttributes - 4;  // 类别数，减掉坐标那4个
-
-	// 坐标缩放比例，模型输出是640x640下的，要转回原图的大小
-	float scaleX = (float)frame.cols / bean_net.netWidth;
-	float scaleY = (float)frame.rows / bean_net.netHeight;
-
-	std::vector<Rect> tmpBoxes;
-	std::vector<int> tmpClassIds;
-	std::vector<float> tmpConfs;
-
-	for (int i = 0; i < numAnchors; i++) {
-		const float* data = outMat.ptr<float>(i);
-
-		// 拿到 640x640 下的中心点坐标和宽高
-		float x_center = data[0];
-		float y_center = data[1];
-		float width = data[2];
-		float height = data[3];
-
-		// 找出分数最高的类别（豆子类别）
-		int classId = -1;
-		float maxConf = 0.0f;
-		for (int c = 0; c < numClasses; c++) {
-			float conf = data[4 + c];
-			if (conf > maxConf) {
-				maxConf = conf;
-				classId = c;
-			}
-		}
-		if (maxConf >= bean_net.confThreshold) {
-			//缩放回原来大小
-			int left = (int)((x_center - width / 2) * scaleX);
-			int top = (int)((y_center - height / 2) * scaleY);
-			int w = (int)(width * scaleX);
-			int h = (int)(height * scaleY);
-
-			Rect box(left, top, w, h);
-			// 防止框超出画面
-			box = box & Rect(0, 0, frame.cols, frame.rows);
-
-			// 过滤太小的框（排除噪点）
-			if (box.width > 2 && box.height > 2) {
-				tmpBoxes.push_back(box);
-				tmpClassIds.push_back(classId);
-				tmpConfs.push_back(maxConf);
-			}
-		}
-	}
-	// NMS是把重叠的框去掉，只留最好的那个
-	vector<int> indices;
-	NMSBoxes(tmpBoxes, tmpConfs, bean_net.confThreshold, bean_net.nmsThreshold, indices);
-
-	// 封装结果
-	for (int idx : indices) {
-		DigitalModel::Result res;
-		res.class_id = tmpClassIds[idx];
-		res.confidence = tmpConfs[idx];
-		res.bbox = tmpBoxes[idx];
-		res.center.x = res.bbox.x + res.bbox.width / 2.0f;
-		res.center.y = res.bbox.y + res.bbox.height / 2.0f;
-		results.push_back(res);
-	}
-
-	return results;
-	}
-};
-
-
-//--------检测结果结构体--------//
 struct DetectionResult
 {
-	int class_id;			// 类别ID
+	int class_id;
 	cv::Rect bbox;
-    float confidence;       // 置信度          
-    std::string label;
+	float confidence;
+	std::string label;
 	cv::Point2f center;
 
-    DetectionResult() 
-		: bbox(), confidence(0.0f), class_id(-1), label("") {}
-    DetectionResult(const cv::Rect& b, float conf, int cid, const std::string& lbl)
-        : bbox(b), confidence(conf), class_id(cid), label(lbl) {
+	DetectionResult() : bbox(), confidence(0.0f), class_id(-1), label("") {}
+	DetectionResult(const cv::Rect& b, float conf, int cid, const std::string& lbl)
+		: bbox(b), confidence(conf), class_id(cid), label(lbl) {
 		center.x = b.x + b.width / 2.0f;
 		center.y = b.y + b.height / 2.0f;
 	}
 };
 
+// ========== 多线程异步推理 ==========
 static cv::VideoCapture cap;
-static int detect_frame_count = 0;
-const int DETECT_INTERVAL = 3; // 每3帧识别一次
-static std::vector<DetectionResult> last_results; // 保存上一帧检测结果
+static auto last_time = steady_clock::now();	//上一帧时间
+static double fps = 0.0;	//实时帧率
 
-static auto last_time = steady_clock::now();
-static double fps = 0.0;
+// 线程同步变量
+static mutex results_mutex;//保护结果
+static mutex frame_mutex;//保护帧
+static condition_variable cv_detect;//线程唤醒/休眠：没事干的时候休眠，不占用CPU
+static atomic<bool> running{ true };//程序开始开关
+static atomic<bool> frame_ready{ false };//新帧就绪标记
+static atomic<bool> detect_done{ true };//推理完成标记
 
-//FPS
+// 共享数据
+static Mat shared_frame;
+static vector<DetectionResult> shared_results;
+
 double calculateFPS() {
 	auto current_time = steady_clock::now();
 	duration<double> delta = current_time - last_time;
 	if (delta.count() > 0) {
-		fps = 1.0 / delta.count();
+		fps = 0.9 * fps + 0.1 * (1.0 / delta.count()); // 平滑FPS
 	}
 	last_time = current_time;
 	return fps;
 }
 
-//显示FPS
 void drawFPS(Mat& frame) {
-	double current_fps = calculateFPS();
-	putText(frame, "FPS: " + to_string((int)current_fps),
+	putText(frame, "FPS: " + to_string((int)fps),
 		Point(10, frame.rows - 30),
 		FONT_HERSHEY_SIMPLEX, 0.8,
 		Scalar(0, 255, 0), 2);
 }
 
-
-//串口
-bool sendSerial(const string& data) {
-	HANDLE h = CreateFileA("COM3", GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-	if (h == INVALID_HANDLE_VALUE) return false;
-
-	DCB dcb;
-	memset(&dcb, 0, sizeof(dcb));
-	dcb.DCBlength = sizeof(dcb);
-	GetCommState(h, &dcb);
-	dcb.BaudRate = CBR_115200;
-	dcb.ByteSize = 8;
-	dcb.Parity = NOPARITY;
-	dcb.StopBits = ONESTOPBIT;
-	SetCommState(h, &dcb);
-
-	DWORD w;
-	WriteFile(h, data.c_str(), data.size(), &w, NULL);
-	CloseHandle(h);
-	return true;
-}
-
-//-------图像采集--------//
-Mat capture_camera(DigitalModel& digit_net, BeanModel& bean_net, vector<DetectionResult>& results, bool need_detect){
-	Mat frame;
-	/*VideoCapture cap(0);
-	if (!cap.isOpened()) {
-		std::cerr << "无法打开摄像头" << std::endl;
-		exit(1);
-	}*/
-	cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-	cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-	cap >> frame;
-	/*cap.release();*/
-	if (frame.empty()) return frame;
-
-	drawFPS(frame);
-	// ----- 隔帧识别逻辑 ----- //
-	detect_frame_count++;
-	bool should_detect = need_detect &&
-		(detect_frame_count % DETECT_INTERVAL == 0 || last_results.empty());
-
-	if (should_detect) {
-		results.clear();
-
-		auto bean_res = bean_net.detect(frame);
-		for (auto& r : bean_res) {
-			results.emplace_back(r.bbox, r.confidence, r.class_id, "bean");
+// 推理线程函数
+void detect_thread(YOLOModel* all_net) {
+	Mat local_frame;
+	while (running) {
+		// 等待新帧
+		{
+			unique_lock<mutex> lock(frame_mutex);
+			cv_detect.wait(lock, [] { return frame_ready.load() || !running; });
+			if (!running) break;
+			if (!frame_ready) continue;
+			local_frame = shared_frame.clone();
+			frame_ready = false;
 		}
 
+		// 执行推理
+		auto all_res = all_net->detect(local_frame);
 
-		auto digit_res = digit_net.detect(frame);
-		for (auto& r : digit_res) {
-			results.emplace_back(r.bbox, r.confidence, r.class_id, "digit");
+		vector<DetectionResult> local_results;
+		vector<string> class_names = {};///////////////////////////记得匹配类别名字！！！！！！！！！
+		for (auto& r : all_res) {
+			string label = class_names[r.class_id];  // 自动匹配名字
+			local_results.emplace_back(r.bbox, r.confidence, r.class_id, label);
 		}
-
-		last_results = results;
+		
+		// 更新结果
+		{
+			lock_guard<mutex> lock(results_mutex);
+			shared_results = move(local_results);
+		}
+		detect_done = true;
 	}
-	else {
-		results = last_results;
-	}
-	//串口发送第一个检测结果
-	/*if (!results.empty()) {
-		auto& r = results[0];
-		string msg = to_string(r.class_id) + ","
-			+ to_string((int)r.center.x) + ","
-			+ to_string((int)r.center.y) + "\n";
-		sendSerial(msg);
-	}
-	return frame;*/
 }
 
 int main() {
-	//加载模型
-	DigitalModel digit_net("digit_yolo.onnx");
-	BeanModel bean_net(BEAN_YOLO); // 这里传入宏定义的字符串
-	vector<DetectionResult> results;
+	YOLOModel all_net(BEAN_YOLO);
 
-	VideoCapture cap(0);
+	cap.open(0);
 	if (!cap.isOpened()) {
-		std::cerr << "无法打开摄像头" << std::endl;
-		exit(1);
+		cerr << "无法打开摄像头" << endl;
+		return -1;
 	}
+	cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+	cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+	cap.set(cv::CAP_PROP_FPS, 30); // 设置摄像头帧率
+	cap.set(cv::CAP_PROP_BUFFERSIZE, 1); // 减少缓冲区大小
+
+	// 启动推理线程
+	thread detect_thread_obj(detect_thread, &all_net);
+
+	Mat frame;
+	vector<DetectionResult> display_results;
+
+	cout << "按 'q' 退出" << endl;
 
 	while (true) {
-		Mat frame = capture_camera(digit_net, bean_net, results, true);
+		cap >> frame;
 		if (frame.empty()) break;
-		
-		// 在图上画框和标签
-		for (const auto& r : results) {
+
+		calculateFPS();
+
+		// 获取最新检测结果
+		{
+			lock_guard<mutex> lock(results_mutex);
+			display_results = shared_results;
+		}
+
+		// 画检测结果
+		for (const auto& r : display_results) {
 			rectangle(frame, r.bbox, Scalar(0, 255, 0), 2);
 			putText(frame, r.label + ":" + to_string((int)(r.confidence * 100)) + "%",
 				Point(r.bbox.x, r.bbox.y - 10),
 				FONT_HERSHEY_SIMPLEX, 0.6,
 				Scalar(0, 255, 0), 2);
 		}
+
+		drawFPS(frame);
 		imshow("检测结果", frame);
+
+		// 发送帧到推理线程
+		if (detect_done.load()) {
+			{
+				lock_guard<mutex> lock(frame_mutex);
+				shared_frame = frame.clone();
+				frame_ready = true;
+			}
+			cv_detect.notify_one();
+			detect_done = false;
+		}
+
 		if (waitKey(1) == 'q') break;
 	}
 
-	cap.release();
+	running = false;
+	cv_detect.notify_all();
+	detect_thread_obj.join();
 
+	cap.release();
 	destroyAllWindows();
 	return 0;
 }
-

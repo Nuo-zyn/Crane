@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git remote *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git config *)",
+      "Bash(git branch *)",
+      "Bash(git push *)",
+      "Bash(git rm *)",
+      "Bash(echo -e \".vs/\\\\nx64/\\\\n*.onnx\\\\n*.ilk\\\\n*.pdb\\\\n*.exe\\\\n*.ipch\\\\n*.db\\\\n*.vsidx\")",
+      "Read(//d/OpenCV/opencv/build/x64/vc16/lib/**)",
+      "Read(//d/OpenCV/opencv/build/x64/**)",
+      "Bash(cmake --build . --config Release)",
+      "Bash(rm -rf CMakeCache.txt CMakeFiles)",
+      "Bash(cmake .. -G \"Visual Studio 17 2022\" -A x64)",
+      "Read(//c/Program Files/**)",
+      "Read(//d/Program Files/**)",
+      "Bash(cmd.exe /c \"\\\\\"C:\\\\\\\\Program Files \\(x86\\)\\\\\\\\Microsoft Visual Studio\\\\\\\\Installer\\\\\\\\vswhere.exe\\\\\" -latest -property installationPath 2>nul\")",
+      "Bash(cmake ..)",
+      "Bash(cmake --build . --config Debug)",
+      "Bash(./Crane.exe)"
+    ]
+  }
+}
