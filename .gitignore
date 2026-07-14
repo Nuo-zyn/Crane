@@ -1,0 +1,7 @@
+build/
+*.o
+*.a
+*.out
+bibilabu
+*.onnx
+.DS_Store

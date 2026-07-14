@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 3 ./bibilabu)",
+      "Bash(ls -la /dev/ttyUSB* /dev/ttyACM* /dev/ttyS* 2>/dev/null | head -20)",
+      "Read(//dev/**)"
+    ]
+  }
+}
